@@ -21,6 +21,16 @@ import sys
 devices = \
 {
   'Allwinner': {
+    'A10' : {
+      'inet97fv2': {
+        'dtb': 'sun4i-a10-inet97fv2.dtb',
+        'config': 'inet97fv2_defconfig'
+      },
+      'mele': {
+        'dtb': 'sun4i-a10-a1000.dtb',
+        'config': 'Mele_A1000_defconfig'
+      },
+    },
     'A20' : {
       'bananapi': {
         'dtb': 'sun7i-a20-bananapi.dtb',
