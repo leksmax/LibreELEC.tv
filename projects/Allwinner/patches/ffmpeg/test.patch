@@ -1,0 +1,497 @@
+diff --git a/libavfilter/vf_deinterlace_v4l2m2m.c b/libavfilter/vf_deinterlace_v4l2m2m.c
+index 8a88b4532695..c4854ce40450 100644
+--- a/libavfilter/vf_deinterlace_v4l2m2m.c
++++ b/libavfilter/vf_deinterlace_v4l2m2m.c
+@@ -28,6 +28,7 @@
+ #include <dirent.h>
+ #include <fcntl.h>
+ #include <poll.h>
++#include <stdatomic.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
+@@ -51,7 +52,7 @@
+ #include "video.h"
+ 
+ typedef struct V4L2Queue V4L2Queue;
+-typedef struct DeintV4L2M2MContext DeintV4L2M2MContext;
++typedef struct DeintV4L2M2MContextShared DeintV4L2M2MContextShared;
+ 
+ typedef struct V4L2PlaneInfo {
+     int bytesperline;
+@@ -61,6 +62,7 @@ typedef struct V4L2PlaneInfo {
+ typedef struct V4L2Buffer {
+     int enqueued;
+     int reenqueue;
++    int fd;
+     struct v4l2_buffer buffer;
+     struct v4l2_plane planes[VIDEO_MAX_PLANES];
+     int num_planes;
+@@ -73,17 +75,17 @@ typedef struct V4L2Queue {
+     struct v4l2_format format;
+     int num_buffers;
+     V4L2Buffer *buffers;
+-    DeintV4L2M2MContext *ctx;
++    DeintV4L2M2MContextShared *ctx;
+ } V4L2Queue;
+ 
+-typedef struct DeintV4L2M2MContext {
+-    const AVClass *class;
+-
++typedef struct DeintV4L2M2MContextShared {
+     int fd;
++    int done;
+     int width;
+     int height;
+     int orig_width;
+     int orig_height;
++    atomic_uint refcount;
+ 
+     AVBufferRef *hw_frames_ctx;
+ 
+@@ -92,9 +94,15 @@ typedef struct DeintV4L2M2MContext {
+ 
+     V4L2Queue output;
+     V4L2Queue capture;
++} DeintV4L2M2MContextShared;
++
++typedef struct DeintV4L2M2MContext {
++    const AVClass *class;
++
++    DeintV4L2M2MContextShared *shared;
+ } DeintV4L2M2MContext;
+ 
+-static int deint_v4l2m2m_prepare_context(DeintV4L2M2MContext *ctx)
++static int deint_v4l2m2m_prepare_context(DeintV4L2M2MContextShared *ctx)
+ {
+     struct v4l2_capability cap;
+     int ret;
+@@ -126,13 +134,13 @@ static int deint_v4l2m2m_prepare_context(DeintV4L2M2MContext *ctx)
+ 
+ static int deint_v4l2m2m_try_format(V4L2Queue *queue)
+ {
+-    struct v4l2_format *fmt = &queue->format;
+-    DeintV4L2M2MContext *ctx = queue->ctx;
++    struct v4l2_format *fmt        = &queue->format;
++    DeintV4L2M2MContextShared *ctx = queue->ctx;
+     int ret, field;
+ 
+     ret = ioctl(ctx->fd, VIDIOC_G_FMT, fmt);
+     if (ret)
+-        av_log(ctx, AV_LOG_ERROR, "VIDIOC_G_FMT failed: %d\n", ret);
++        av_log(NULL, AV_LOG_ERROR, "VIDIOC_G_FMT failed: %d\n", ret);
+ 
+     if (V4L2_TYPE_IS_OUTPUT(fmt->type))
+         field = V4L2_FIELD_INTERLACED_TB;
+@@ -158,14 +166,14 @@ static int deint_v4l2m2m_try_format(V4L2Queue *queue)
+     if (V4L2_TYPE_IS_MULTIPLANAR(fmt->type)) {
+         if (fmt->fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12 ||
+             fmt->fmt.pix_mp.field != field) {
+-            av_log(ctx, AV_LOG_DEBUG, "format not supported for type %d\n", fmt->type);
++            av_log(NULL, AV_LOG_DEBUG, "format not supported for type %d\n", fmt->type);
+ 
+             return AVERROR(EINVAL);
+         }
+     } else {
+         if (fmt->fmt.pix.pixelformat != V4L2_PIX_FMT_NV12 ||
+             fmt->fmt.pix.field != field) {
+-            av_log(ctx, AV_LOG_DEBUG, "format not supported for type %d\n", fmt->type);
++            av_log(NULL, AV_LOG_DEBUG, "format not supported for type %d\n", fmt->type);
+ 
+             return AVERROR(EINVAL);
+         }
+@@ -176,8 +184,8 @@ static int deint_v4l2m2m_try_format(V4L2Queue *queue)
+ 
+ static int deint_v4l2m2m_set_format(V4L2Queue *queue, uint32_t field, int width, int height)
+ {
+-    struct v4l2_format *fmt = &queue->format;
+-    DeintV4L2M2MContext *ctx = queue->ctx;
++    struct v4l2_format *fmt        = &queue->format;
++    DeintV4L2M2MContextShared *ctx = queue->ctx;
+     int ret;
+ 
+     if (V4L2_TYPE_IS_MULTIPLANAR(fmt->type)) {
+@@ -194,12 +202,12 @@ static int deint_v4l2m2m_set_format(V4L2Queue *queue, uint32_t field, int width,
+ 
+     ret = ioctl(ctx->fd, VIDIOC_S_FMT, fmt);
+     if (ret)
+-        av_log(ctx, AV_LOG_ERROR, "VIDIOC_S_FMT failed: %d\n", ret);
++        av_log(NULL, AV_LOG_ERROR, "VIDIOC_S_FMT failed: %d\n", ret);
+ 
+     return ret;
+ }
+ 
+-static int deint_v4l2m2m_probe_device(DeintV4L2M2MContext *ctx, char *node)
++static int deint_v4l2m2m_probe_device(DeintV4L2M2MContextShared *ctx, char *node)
+ {
+     int ret;
+ 
+@@ -228,7 +236,7 @@ fail:
+     return ret;
+ }
+ 
+-static int deint_v4l2m2m_find_device(DeintV4L2M2MContext *ctx)
++static int deint_v4l2m2m_find_device(DeintV4L2M2MContextShared *ctx)
+ {
+     int ret = AVERROR(EINVAL);
+     struct dirent *entry;
+@@ -245,7 +253,7 @@ static int deint_v4l2m2m_find_device(DeintV4L2M2MContext *ctx)
+             continue;
+ 
+         snprintf(node, sizeof(node), "/dev/%s", entry->d_name);
+-        av_log(ctx, AV_LOG_DEBUG, "probing device %s\n", node);
++        av_log(NULL, AV_LOG_DEBUG, "probing device %s\n", node);
+         ret = deint_v4l2m2m_probe_device(ctx, node);
+         if (!ret)
+             break;
+@@ -254,13 +262,13 @@ static int deint_v4l2m2m_find_device(DeintV4L2M2MContext *ctx)
+     closedir(dirp);
+ 
+     if (ret) {
+-        av_log(ctx, AV_LOG_ERROR, "Could not find a valid device\n");
++        av_log(NULL, AV_LOG_ERROR, "Could not find a valid device\n");
+         ctx->fd = -1;
+ 
+         return ret;
+     }
+ 
+-    av_log(ctx, AV_LOG_INFO, "Using device %s\n", node);
++    av_log(NULL, AV_LOG_INFO, "Using device %s\n", node);
+ 
+     return 0;
+ }
+@@ -294,6 +302,8 @@ static int v4l2_buffer_export_drm(V4L2Buffer* avbuf)
+         if (ret < 0)
+             return AVERROR(errno);
+ 
++        avbuf->fd = expbuf.fd;
++
+         if (V4L2_TYPE_IS_MULTIPLANAR(avbuf->buffer.type)) {
+             /* drm frame */
+             avbuf->drm_frame.objects[i].size = avbuf->buffer.m.planes[i].length;
+@@ -313,7 +323,7 @@ static int v4l2_buffer_export_drm(V4L2Buffer* avbuf)
+ static int deint_v4l2m2m_allocate_buffers(V4L2Queue *queue)
+ {
+     struct v4l2_format *fmt = &queue->format;
+-    DeintV4L2M2MContext *ctx = queue->ctx;
++    DeintV4L2M2MContextShared *ctx = queue->ctx;
+     struct v4l2_requestbuffers req;
+     int ret, i, j, multiplanar;
+     uint32_t memory;
+@@ -330,7 +340,7 @@ static int deint_v4l2m2m_allocate_buffers(V4L2Queue *queue)
+ 
+     ret = ioctl(ctx->fd, VIDIOC_REQBUFS, &req);
+     if (ret < 0) {
+-        av_log(ctx, AV_LOG_ERROR, "VIDIOC_REQBUFS failed: %s\n", strerror(errno));
++        av_log(NULL, AV_LOG_ERROR, "VIDIOC_REQBUFS failed: %s\n", strerror(errno));
+ 
+         return AVERROR(errno);
+     }
+@@ -338,7 +348,7 @@ static int deint_v4l2m2m_allocate_buffers(V4L2Queue *queue)
+     queue->num_buffers = req.count;
+     queue->buffers = av_mallocz(queue->num_buffers * sizeof(V4L2Buffer));
+     if (!queue->buffers) {
+-        av_log(ctx, AV_LOG_ERROR, "malloc enomem\n");
++        av_log(NULL, AV_LOG_ERROR, "malloc enomem\n");
+ 
+         return AVERROR(ENOMEM);
+     }
+@@ -347,6 +357,7 @@ static int deint_v4l2m2m_allocate_buffers(V4L2Queue *queue)
+         V4L2Buffer *buf = &queue->buffers[i];
+ 
+         buf->enqueued = 0;
++        buf->fd = -1;
+         buf->q = queue;
+ 
+         buf->buffer.type = fmt->type;
+@@ -380,8 +391,6 @@ static int deint_v4l2m2m_allocate_buffers(V4L2Queue *queue)
+                 info->bytesperline = fmt->fmt.pix.bytesperline;
+                 info->length = buf->buffer.length;
+             }
+-
+-            av_log(ctx, AV_LOG_DEBUG, "deint - type: %d, bpl: %d, length: %d\n", queue->format.type, info->bytesperline, info->length);
+         }
+ 
+         if (!V4L2_TYPE_IS_OUTPUT(fmt->type)) {
+@@ -398,7 +407,9 @@ static int deint_v4l2m2m_allocate_buffers(V4L2Queue *queue)
+     return 0;
+ 
+ fail:
+-    /* TODO: close all dmabuf fds */
++    for (i = 0; i < queue->num_buffers; i++)
++        if (queue->buffers[i].fd >= 0)
++            close(queue->buffers[i].fd);
+     av_free(queue->buffers);
+     queue->buffers = NULL;
+ 
+@@ -417,10 +428,22 @@ static int deint_v4l2m2m_streamon(V4L2Queue *queue)
+     return 0;
+ }
+ 
++static int deint_v4l2m2m_streamoff(V4L2Queue *queue)
++{
++    int type = queue->format.type;
++    int ret;
++
++    ret = ioctl(queue->ctx->fd, VIDIOC_STREAMOFF, &type);
++    if (ret < 0)
++        return AVERROR(errno);
++
++    return 0;
++}
++
+ static V4L2Buffer* deint_v4l2m2m_dequeue_buffer(V4L2Queue *queue, int timeout)
+ {
+     struct v4l2_plane planes[VIDEO_MAX_PLANES];
+-    DeintV4L2M2MContext *ctx = queue->ctx;
++    DeintV4L2M2MContextShared *ctx = queue->ctx;
+     struct v4l2_buffer buf = { 0 };
+     V4L2Buffer* avbuf = NULL;
+     struct pollfd pfd;
+@@ -460,7 +483,7 @@ static V4L2Buffer* deint_v4l2m2m_dequeue_buffer(V4L2Queue *queue, int timeout)
+         ret = ioctl(ctx->fd, VIDIOC_DQBUF, &buf);
+         if (ret) {
+             if (errno != EAGAIN)
+-                av_log(ctx, AV_LOG_DEBUG, "VIDIOC_DQBUF, errno (%s)\n",
++                av_log(NULL, AV_LOG_DEBUG, "VIDIOC_DQBUF, errno (%s)\n",
+                        av_err2str(AVERROR(errno)));
+             return NULL;
+         }
+@@ -512,12 +535,56 @@ static int deint_v4l2m2m_enqueue(V4L2Queue *queue, const AVFrame* frame)
+     return deint_v4l2m2m_enqueue_buffer(buf);
+ }
+ 
++static void deint_v4l2m2m_destroy_context(DeintV4L2M2MContextShared *ctx)
++{
++    if (atomic_fetch_sub(&ctx->refcount, 1) == 1) {
++        V4L2Queue *capture = &ctx->capture;
++        V4L2Queue *output  = &ctx->output;
++        int i;
++
++        av_log(NULL, AV_LOG_DEBUG, "%s - destroying context\n", __func__);
++
++        if (ctx->fd >= 0) {
++            deint_v4l2m2m_streamoff(capture);
++            deint_v4l2m2m_streamoff(output);
++        }
++
++        if (capture->buffers)
++            for (i = 0; i < capture->num_buffers; i++) {
++                capture->buffers[i].q = NULL;
++                if (capture->buffers[i].fd >= 0)
++                    close(capture->buffers[i].fd);
++            }
++
++        for (i = 0; i < ctx->frame_count; i++)
++            av_frame_free(&ctx->frames[i]);
++
++        av_buffer_unref(&ctx->hw_frames_ctx);
++
++        if (capture->buffers)
++            av_free(capture->buffers);
++
++        if (output->buffers)
++            av_free(output->buffers);
++
++        if (ctx->fd >= 0) {
++            close(ctx->fd);
++            ctx->fd = -1;
++        }
++
++        av_free(ctx);
++    }
++}
++
+ static void v4l2_free_buffer(void *opaque, uint8_t *unused)
+ {
+-    V4L2Buffer *buf = opaque;
++    V4L2Buffer *buf                = opaque;
++    DeintV4L2M2MContextShared *ctx = buf->q->ctx;
+ 
+-    if (buf->reenqueue)
++    if (!ctx->done)
+         deint_v4l2m2m_enqueue_buffer(buf);
++
++    deint_v4l2m2m_destroy_context(ctx);
+ }
+ 
+ static uint8_t *v4l2_get_drm_frame(V4L2Buffer *avbuf, int height)
+@@ -553,12 +620,12 @@ static uint8_t *v4l2_get_drm_frame(V4L2Buffer *avbuf, int height)
+ 
+ static int deint_v4l2m2m_dequeue_frame(V4L2Queue *queue, AVFrame* frame, int timeout)
+ {
+-    DeintV4L2M2MContext *ctx = queue->ctx;
+-    V4L2Buffer* avbuf = NULL;
++    DeintV4L2M2MContextShared *ctx = queue->ctx;
++    V4L2Buffer* avbuf;
+ 
+     avbuf = deint_v4l2m2m_dequeue_buffer(queue, timeout);
+     if (!avbuf) {
+-        av_log(ctx, AV_LOG_ERROR, "dequeueing failed\n");
++        av_log(NULL, AV_LOG_ERROR, "dequeueing failed\n");
+         return AVERROR(EINVAL);
+     }
+ 
+@@ -568,15 +635,16 @@ static int deint_v4l2m2m_dequeue_frame(V4L2Queue *queue, AVFrame* frame, int tim
+     if (!frame->buf[0])
+         return AVERROR(ENOMEM);
+ 
++    atomic_fetch_add(&ctx->refcount, 1);
++
+     frame->data[0] = (uint8_t *)v4l2_get_drm_frame(avbuf, ctx->orig_height);
+     frame->format = AV_PIX_FMT_DRM_PRIME;
+     frame->hw_frames_ctx = av_buffer_ref(ctx->hw_frames_ctx);
+     frame->height = ctx->height;
+     frame->width = ctx->width;
+ 
+-    avbuf->reenqueue = !V4L2_TYPE_IS_OUTPUT(queue->format.type);
+     if (avbuf->buffer.flags & V4L2_BUF_FLAG_ERROR) {
+-        av_log(ctx, AV_LOG_ERROR, "driver decode error\n");
++        av_log(NULL, AV_LOG_ERROR, "driver decode error\n");
+         frame->decode_error_flags |= FF_DECODE_ERROR_INVALID_BITSTREAM;
+     }
+ 
+@@ -585,9 +653,10 @@ static int deint_v4l2m2m_dequeue_frame(V4L2Queue *queue, AVFrame* frame, int tim
+ 
+ static int deint_v4l2m2m_dequeue(AVFilterContext *avctx, AVFrame *input_frame, int field)
+ {
+-    DeintV4L2M2MContext *ctx = avctx->priv;
+-    AVFilterLink *outlink    = avctx->outputs[0];
+-    AVFrame *output_frame    = NULL;
++    DeintV4L2M2MContext *priv      = avctx->priv;
++    DeintV4L2M2MContextShared *ctx = priv->shared;
++    AVFilterLink *outlink          = avctx->outputs[0];
++    AVFrame *output_frame;
+     int err;
+ 
+     output_frame = av_frame_alloc();
+@@ -597,7 +666,7 @@ static int deint_v4l2m2m_dequeue(AVFilterContext *avctx, AVFrame *input_frame, i
+ 
+     err = deint_v4l2m2m_dequeue_frame(&ctx->capture, output_frame, 500);
+     if (err < 0) {
+-        av_log(ctx, AV_LOG_ERROR, "no frame (field %d)\n", field);
++        av_log(priv, AV_LOG_ERROR, "no frame (field %d)\n", field);
+         goto fail;
+     }
+ 
+@@ -607,17 +676,19 @@ static int deint_v4l2m2m_dequeue(AVFilterContext *avctx, AVFrame *input_frame, i
+ 
+     output_frame->interlaced_frame = 0;
+ 
+-    if (field == 1) {
++    if (field == 0) {
++        output_frame->pts *= 2;
++    } else {
+         int64_t cur_pts  = ctx->frames[0]->pts;
+         int64_t next_pts = ctx->frames[1]->pts;
+ 
+         if (next_pts != AV_NOPTS_VALUE && cur_pts != AV_NOPTS_VALUE) {
+-            output_frame->pts = (next_pts - cur_pts) / 2;
++            output_frame->pts = next_pts + cur_pts;
+         } else {
+             output_frame->pts = AV_NOPTS_VALUE;
+         }
+     }
+-    av_log(ctx, AV_LOG_DEBUG, "pts: %"PRId64" (field %d)\n", output_frame->pts, field);
++    av_log(priv, AV_LOG_DEBUG, "pts: %"PRId64" (field %d)\n", output_frame->pts, field);
+ 
+     return ff_filter_frame(outlink, output_frame);
+ 
+@@ -628,9 +699,10 @@ fail:
+ 
+ static int deint_v4l2m2m_config_props(AVFilterLink *outlink)
+ {
+-    AVFilterLink *inlink     = outlink->src->inputs[0];
+-    AVFilterContext *avctx   = outlink->src;
+-    DeintV4L2M2MContext *ctx = avctx->priv;
++    AVFilterLink *inlink           = outlink->src->inputs[0];
++    AVFilterContext *avctx         = outlink->src;
++    DeintV4L2M2MContext *priv      = avctx->priv;
++    DeintV4L2M2MContextShared *ctx = priv->shared;
+     int ret;
+ 
+     ctx->height = avctx->inputs[0]->h;
+@@ -650,7 +722,7 @@ static int deint_v4l2m2m_config_props(AVFilterLink *outlink)
+             return AVERROR(ENOMEM);
+ 
+     if (!inlink->hw_frames_ctx) {
+-        av_log(ctx, AV_LOG_ERROR, "No hw context provided on input\n");
++        av_log(priv, AV_LOG_ERROR, "No hw context provided on input\n");
+         return AVERROR(EINVAL);
+     }
+ 
+@@ -669,13 +741,14 @@ static int deint_v4l2m2m_query_formats(AVFilterContext *avctx)
+ 
+ static int deint_v4l2m2m_filter_frame(AVFilterLink *link, AVFrame *in)
+ {
+-    AVFilterContext *avctx   = link->dst;
+-    DeintV4L2M2MContext *ctx = avctx->priv;
+-    V4L2Queue *capture       = &ctx->capture;
+-    V4L2Queue *output        = &ctx->output;
++    AVFilterContext *avctx         = link->dst;
++    DeintV4L2M2MContext *priv      = avctx->priv;
++    DeintV4L2M2MContextShared *ctx = priv->shared;
++    V4L2Queue *capture             = &ctx->capture;
++    V4L2Queue *output              = &ctx->output;
+     int ret;
+ 
+-    av_log(ctx, AV_LOG_DEBUG, "input pts: %"PRId64"\n", in->pts);
++    av_log(priv, AV_LOG_DEBUG, "input pts: %"PRId64"\n", in->pts);
+     if (!ctx->frame_count) {
+         AVDRMFrameDescriptor *drm_desc = (AVDRMFrameDescriptor *)in->data[0];
+         unsigned int field;
+@@ -740,41 +813,32 @@ static int deint_v4l2m2m_filter_frame(AVFilterLink *link, AVFrame *in)
+ 
+ static av_cold int deint_v4l2m2m_init(AVFilterContext *avctx)
+ {
+-    DeintV4L2M2MContext *ctx = avctx->priv;
++    DeintV4L2M2MContext *priv = avctx->priv;
++    DeintV4L2M2MContextShared *ctx;
+ 
++    ctx = av_mallocz(sizeof(DeintV4L2M2MContextShared));
++    if (!ctx)
++        return AVERROR(ENOMEM);
++
++    priv->shared = ctx;
+     ctx->fd = -1;
+     ctx->output.ctx = ctx;
+     ctx->output.num_buffers = 6;
+     ctx->capture.ctx = ctx;
+     ctx->capture.num_buffers = 6;
++    ctx->done = 0;
++    atomic_init(&ctx->refcount, 1);
+ 
+     return 0;
+ }
+ 
+ static void deint_v4l2m2m_uninit(AVFilterContext *avctx)
+ {
+-    DeintV4L2M2MContext *ctx = avctx->priv;
+-    V4L2Queue *capture       = &ctx->capture;
+-    V4L2Queue *output        = &ctx->output;
+-    int i;
++    DeintV4L2M2MContext *priv = avctx->priv;
++    DeintV4L2M2MContextShared *ctx = priv->shared;
+ 
+-    if (capture->buffers)
+-        for (i = 0; i < capture->num_buffers; i++)
+-            capture->buffers[i].reenqueue = 0;
+-
+-    for (i = 0; i < ctx->frame_count; i++)
+-        av_frame_free(&ctx->frames[i]);
+-
+-    av_buffer_unref(&ctx->hw_frames_ctx);
+-
+-    if (capture->buffers)
+-        av_free(capture->buffers);
+-
+-    if (output->buffers)
+-        av_free(output->buffers);
+-
+-    if (ctx->fd > -1)
+-        close(ctx->fd);
++    ctx->done = 1;
++    deint_v4l2m2m_destroy_context(ctx);
+ }
+ 
+ static const AVOption deinterlace_v4l2m2m_options[] = {
